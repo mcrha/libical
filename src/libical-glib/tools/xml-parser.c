@@ -261,6 +261,44 @@ void enumeration_free(Enumeration *enumeration)
     g_free(enumeration);
 }
 
+TemplateData *template_data_new(const char *name,
+                                const char *requires_attrs) /* comma-separated list of required attributes */
+{
+    TemplateData *data;
+    guint ii;
+
+    if (name == NULL) {
+        g_warning("Cannot create API template without name");
+        return NULL;
+    }
+    if (requires_attrs == NULL) {
+        g_warning("API template '%s' does not have set 'requires' attribute", name);
+        return NULL;
+    }
+
+    data = g_new0(TemplateData, 1);
+    data->name = g_strdup(name);
+    data->requires_attrs = g_strsplit(requires_attrs, ",", 0);
+    data->variables = g_new0(gchar *, g_strv_length(data->requires_attrs) + 1);
+    for (ii = 0; data->requires_attrs[ii] != NULL; ii++) {
+        data->variables[ii] = g_strconcat ("${", data->requires_attrs[ii], "}", NULL);
+    }
+
+    return data;
+}
+
+void template_data_free(TemplateData *data)
+{
+    if (data == NULL)
+        return;
+
+    g_free(data->name);
+    g_strfreev(data->requires_attrs);
+    g_strfreev(data->variables);
+    g_clear_pointer(&data->methods, g_ptr_array_unref);
+    g_free(data);
+}
+
 static gchar *dup_attribute_value(xmlDocPtr doc, const xmlNode *list, int inLine)
 {
     xmlChar *xml_value;
@@ -548,7 +586,139 @@ gboolean parse_enumeration(xmlNode *node, Enumeration *enumeration)
     return TRUE;
 }
 
-gboolean parse_structure(xmlNode *node, Structure *structure)
+static char *
+replace_variables_in_string(const char *str,
+                            GHashTable *variables)
+{
+    GString *tmp;
+    guint ii;
+
+    if (str == NULL || !strstr(str, "${"))
+        return g_strdup(str);
+
+    tmp = g_string_new(str);
+    for (ii = 0; ii < tmp->len; ii++) {
+        if (tmp->str[ii] == '$' && tmp->str[ii + 1] == '{') {
+            char *end = strchr(tmp->str + ii + 1, '}');
+            if (end != NULL) {
+                const gchar *value;
+                char last = end[1];
+                end[1] = '\0';
+                value = g_hash_table_lookup(variables, tmp->str + ii);
+                if (value) {
+                    end[1] = last;
+                    g_string_erase(tmp, ii, end - tmp->str - ii + 1);
+                    g_string_insert(tmp, ii, value);
+                    ii += strlen(value);
+                } else {
+                    g_warning("Cannot find variable '%s'", tmp->str + ii);
+                    end[1] = last;
+                }
+            }
+        }
+    }
+
+    return g_string_free(tmp, FALSE);
+}
+
+static void
+parse_method_from_template(xmlNode *node,
+			   GHashTable *api_templates,
+			   Structure *structure)
+{
+    TemplateData *data;
+    xmlChar *name;
+
+    if (xmlStrcmp(node->name, (const xmlChar *)"method-from-template") != 0) {
+        return;
+    }
+
+    name = xmlGetProp(node, (const xmlChar *)"name");
+    if (name == NULL) {
+        g_warning("Missing 'name' attribute on 'method-from-template'");
+        return;
+    }
+
+    data = g_hash_table_lookup(api_templates, (const char*)name);
+    if (data != NULL) {
+        xmlChar *since = xmlGetProp(node, (const xmlChar *)"since");
+        GHashTable *variables; /* char * "${name}"~>value */
+        guint ii;
+
+        variables = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, (GDestroyNotify) xmlFree);
+        for (ii = 0; data->requires_attrs[ii] != NULL; ii++) {
+            xmlChar *value = xmlGetProp(node, (const xmlChar *)data->requires_attrs[ii]);
+            if (value != NULL) {
+                g_hash_table_insert(variables, data->variables[ii], value);
+            } else {
+                g_warning("Required attribute '%s' for template '%s' not found in structure '%s'", data->requires_attrs[ii], (const char *)name, structure->name);
+            }
+        }
+
+        for (ii = 0; data->methods != NULL && ii < data->methods->len; ii++) {
+            const Method *tmp_method = g_ptr_array_index(data->methods, ii);
+            Method *method = method_new();
+            GList *link;
+
+            #define fill_str_member(_out_str, _in_str, _member) (_out_str)->_member = replace_variables_in_string((_in_str)->_member, variables)
+            #define copy_str_list(_out_str, _in_str, _member) (_out_str)->_member = g_list_copy_deep((_in_str)->_member, (GCopyFunc)((void *)g_strdup), NULL)
+
+            fill_str_member(method, tmp_method, name);
+            fill_str_member(method, tmp_method, corresponds);
+            fill_str_member(method, tmp_method, kind);
+            fill_str_member(method, tmp_method, since);
+            fill_str_member(method, tmp_method, comment);
+            fill_str_member(method, tmp_method, custom);
+            copy_str_list(method, tmp_method, annotations);
+
+            if (tmp_method->ret != NULL) {
+                method->ret = ret_new();
+                fill_str_member(method->ret, tmp_method->ret, type);
+                copy_str_list(method->ret, tmp_method->ret, annotations);
+                fill_str_member(method->ret, tmp_method->ret, comment);
+                fill_str_member(method->ret, tmp_method->ret, translator);
+		copy_str_list(method->ret, tmp_method->ret, translatorArgus);
+                fill_str_member(method->ret, tmp_method->ret, errorReturnValue);
+            }
+
+            for (link = tmp_method->parameters; link != NULL; link = g_list_next(link)) {
+                const Parameter *tmp_param = link->data;
+                Parameter *param = parameter_new();
+
+                fill_str_member(param, tmp_param, type);
+                copy_str_list(param, tmp_param, annotations);
+                fill_str_member(param, tmp_param, comment);
+                fill_str_member(param, tmp_param, name);
+                fill_str_member(param, tmp_param, autofill);
+                fill_str_member(param, tmp_param, translator);
+		copy_str_list(param, tmp_param, translatorArgus);
+                fill_str_member(param, tmp_param, native_op);
+                fill_str_member(param, tmp_param, owner_op);
+
+                method->parameters = g_list_prepend(method->parameters, param);
+            }
+
+            #undef fill_str_member
+            #undef copy_str_list
+
+            method->parameters = g_list_reverse(method->parameters);
+            if (method->since == NULL && since != NULL)
+                method->since = g_strdup((const char *)since);
+            if (method->since == NULL)
+                method->since = g_strdup("4.0"); /* get it from somewhere */
+
+            structure->methods = g_list_prepend(structure->methods, method);
+        }
+
+        g_hash_table_unref(variables);
+        g_clear_pointer(&since, xmlFree);
+    } else {
+        g_warning("No method template named '%s' found", (const char *)name);
+    }
+    g_clear_pointer(&name, xmlFree);
+}
+
+gboolean parse_structure(xmlNode *node, Structure *structure, GHashTable *api_templates)
 {
     xmlAttr *attr;
     xmlNode *child;
@@ -610,9 +780,11 @@ gboolean parse_structure(xmlNode *node, Structure *structure)
             if (!parse_method(child, method)) {
                 method_free(method);
             } else {
-                structure->methods = g_list_append(structure->methods, method);
+                structure->methods = g_list_prepend(structure->methods, method);
             }
             method = NULL;
+        } else if (g_strcmp0((gchar *)child->name, "method-from-template") == 0) {
+            parse_method_from_template(child, api_templates, structure);
         }
         if (g_strcmp0((gchar *)child->name, "declaration") == 0) {
             declaration = declaration_new();
@@ -641,6 +813,7 @@ gboolean parse_structure(xmlNode *node, Structure *structure)
     }
 
     populate_dependencies(structure);
+    structure->methods = g_list_reverse(structure->methods);
 
     return TRUE;
 }
